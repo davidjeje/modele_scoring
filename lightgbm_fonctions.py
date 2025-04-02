@@ -5,11 +5,10 @@ import gc
 import time
 from contextlib import contextmanager
 from lightgbm import LGBMClassifier
-from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score, confusion_matrix, log_loss
-from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score, confusion_matrix, log_loss, precision_score, recall_score, f1_score
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score, train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, recall_score, log_loss
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 from sklearn.linear_model import LogisticRegression
@@ -19,11 +18,8 @@ from xgboost import XGBClassifier
 from imblearn.over_sampling import SMOTE
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import StratifiedKFold, KFold
-from sklearn.metrics import accuracy_score, roc_curve, roc_auc_score, confusion_matrix, log_loss
 from xgboost import XGBClassifier
 from sklearn.utils import shuffle
-
 from sklearn.svm import SVC
 from sklearn.ensemble import AdaBoostClassifier
 from sklearn.linear_model import LogisticRegressionCV
@@ -242,7 +238,243 @@ def credit_card_balance(num_rows = None, nan_as_category = True):
     cc_agg['CC_COUNT'] = cc.groupby('SK_ID_CURR').size()
     del cc
     gc.collect()
-    return 
+    return cc_agg
+
+# LightGBM GBDT with KFold or Stratified KFold
+# Parameters from Tilii kernel: https://www.kaggle.com/tilii7/olivier-lightgbm-parameters-by-bayesian-opt/code
+# def kfold_lightgbm(df, num_folds, stratified = False, debug= False):
+#     # Divide in training/validation and test data
+#     train_df = df[df['TARGET'].notnull()]
+#     test_df = df[df['TARGET'].isnull()]
+#     print("Starting LightGBM. Train shape: {}, test shape: {}".format(train_df.shape, test_df.shape))
+#     del df
+#     gc.collect()
+#     # Cross validation model
+#     if stratified:
+#         folds = StratifiedKFold(n_splits= num_folds, shuffle=True, random_state=1001)
+#     else:
+#         folds = KFold(n_splits= num_folds, shuffle=True, random_state=1001)
+#     # Create arrays and dataframes to store results
+#     oof_preds = np.zeros(train_df.shape[0])
+#     sub_preds = np.zeros(test_df.shape[0])
+#     feature_importance_df = pd.DataFrame()
+#     feats = [f for f in train_df.columns if f not in ['TARGET','SK_ID_CURR','SK_ID_BUREAU','SK_ID_PREV','index']]
+    
+#     for n_fold, (train_idx, valid_idx) in enumerate(folds.split(train_df[feats], train_df['TARGET'])):
+#         train_x, train_y = train_df[feats].iloc[train_idx], train_df['TARGET'].iloc[train_idx]
+#         valid_x, valid_y = train_df[feats].iloc[valid_idx], train_df['TARGET'].iloc[valid_idx]
+
+#         # LightGBM parameters found by Bayesian optimization
+#         clf = LGBMClassifier(
+#             nthread=4,
+#             n_estimators=10000,
+#             learning_rate=0.02,
+#             num_leaves=34,
+#             colsample_bytree=0.9497036,
+#             subsample=0.8715623,
+#             max_depth=8,
+#             reg_alpha=0.041545473,
+#             reg_lambda=0.0735294,
+#             min_split_gain=0.0222415,
+#             min_child_weight=39.3259775,
+#             silent=-1,
+#             verbose=-1, )
+
+#         clf.fit(train_x, train_y, eval_set=[(train_x, train_y), (valid_x, valid_y)], 
+#             eval_metric= 'auc', verbose= 200, early_stopping_rounds= 200)
+
+#         oof_preds[valid_idx] = clf.predict_proba(valid_x, num_iteration=clf.best_iteration_)[:, 1]
+#         sub_preds += clf.predict_proba(test_df[feats], num_iteration=clf.best_iteration_)[:, 1] / folds.n_splits
+
+#         fold_importance_df = pd.DataFrame()
+#         fold_importance_df["feature"] = feats
+#         fold_importance_df["importance"] = clf.feature_importances_
+#         fold_importance_df["fold"] = n_fold + 1
+#         feature_importance_df = pd.concat([feature_importance_df, fold_importance_df], axis=0)
+#         print('Fold %2d AUC : %.6f' % (n_fold + 1, roc_auc_score(valid_y, oof_preds[valid_idx])))
+#         del clf, train_x, train_y, valid_x, valid_y
+#         gc.collect()
+
+#     print('Full AUC score %.6f' % roc_auc_score(train_df['TARGET'], oof_preds))
+#     # Write submission file and plot feature importance
+#     if not debug:
+#         test_df['TARGET'] = sub_preds
+#         test_df[['SK_ID_CURR', 'TARGET']].to_csv(submission_file_name, index= False)
+#     display_importances(feature_importance_df)
+#     return feature_importance_df
+
+def kfold_lightgbm(df, num_folds, stratified=True, debug=False, plot_feature_importance=True):
+    """
+    LightGBM GBDT with KFold or Stratified KFold cross-validation. 
+    Takes care of missing values and outputs key evaluation metrics.
+
+    Parameters:
+    - df: DataFrame with features and target (TARGET column required)
+    - num_folds: Number of folds for cross-validation
+    - stratified: If True, use StratifiedKFold (default: True)
+    - debug: If True, skips submission generation (default: False)
+    - plot_feature_importance: If True, plot the feature importance (default: True)
+
+    Returns:
+    - oof_preds: Out-of-Fold predictions
+    - sub_preds: Test set predictions
+    - feature_importance_df: DataFrame with feature importances
+    """
+
+    # Séparer les données d'entraînement et de test
+    train_df = df[df['TARGET'].notnull()]
+    test_df = df[df['TARGET'].isnull()]
+    print(f"Starting LightGBM. Train shape: {train_df.shape}, test shape: {test_df.shape}")
+    del df
+    gc.collect()
+
+    # Cross-validation model
+    if stratified:
+        folds = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=1001)
+    else:
+        folds = KFold(n_splits=num_folds, shuffle=True, random_state=1001)
+
+    # Création des variables pour stocker les résultats
+    oof_preds = np.zeros(train_df.shape[0])
+    sub_preds = np.zeros(test_df.shape[0])
+    feature_importance_df = pd.DataFrame()
+    feats = [f for f in train_df.columns if f not in ['TARGET', 'SK_ID_CURR', 'SK_ID_BUREAU', 'SK_ID_PREV', 'index']]
+
+    # Listes pour stocker les données de la courbe ROC
+    fpr_all = []
+    tpr_all = []
+    roc_auc_all = []
+
+    for n_fold, (train_idx, valid_idx) in enumerate(folds.split(train_df[feats], train_df['TARGET'])):
+        train_x, train_y = train_df[feats].iloc[train_idx], train_df['TARGET'].iloc[train_idx]
+        valid_x, valid_y = train_df[feats].iloc[valid_idx], train_df['TARGET'].iloc[valid_idx]
+
+        # Paramètres LightGBM
+        clf = LGBMClassifier(
+            nthread=4,
+            n_estimators=10000,
+            learning_rate=0.02,
+            num_leaves=34,
+            colsample_bytree=0.9497036,
+            subsample=0.8715623,
+            max_depth=None,
+            reg_alpha=0.041545473,
+            reg_lambda=0.0735294,
+            min_split_gain=0.0222415,
+            min_child_weight=39.3259775,
+            silent=-1,
+            verbosity=-1,
+        )
+
+        # Callbacks pour arrêter l'entraînement tôt et logguer les évaluations
+        callbacks = [
+            lgb.early_stopping(stopping_rounds=200),  # Arrêter l'entraînement après 200 tours sans amélioration
+            lgb.log_evaluation(200)  # Logguer toutes les 200 itérations
+        ]
+
+        clf.fit(train_x, train_y, eval_set=[(train_x, train_y), (valid_x, valid_y)],
+                eval_metric='auc', callbacks=callbacks)
+
+        oof_preds[valid_idx] = clf.predict_proba(valid_x, num_iteration=clf.best_iteration_)[:, 1]
+        sub_preds += clf.predict_proba(test_df[feats], num_iteration=clf.best_iteration_)[:, 1] / folds.n_splits
+
+        # Calcul des métriques de performance
+        accuracy = accuracy_score(valid_y, clf.predict(valid_x))
+        precision = precision_score(valid_y, clf.predict(valid_x))
+        recall = recall_score(valid_y, clf.predict(valid_x))
+        f1 = f1_score(valid_y, clf.predict(valid_x))
+        auc = roc_auc_score(valid_y, oof_preds[valid_idx])
+
+        print(f'Fold {n_fold + 1} AUC : {auc:.6f}')
+        print(f'Fold {n_fold + 1} Accuracy : {accuracy:.6f}')
+        print(f'Fold {n_fold + 1} Precision : {precision:.6f}')
+        print(f'Fold {n_fold + 1} Recall : {recall:.6f}')
+        print(f'Fold {n_fold + 1} F1-score : {f1:.6f}')
+        
+        # Stockage des données de la courbe ROC
+        fpr, tpr, _ = roc_curve(valid_y, oof_preds[valid_idx])
+        fpr_all.append(fpr)
+        tpr_all.append(tpr)
+        roc_auc_all.append(auc)
+
+        # Collecte de l'importance des caractéristiques
+        fold_importance_df = pd.DataFrame()
+        fold_importance_df["feature"] = feats
+        fold_importance_df["importance"] = clf.feature_importances_
+        fold_importance_df["fold"] = n_fold + 1
+        feature_importance_df = pd.concat([feature_importance_df, fold_importance_df], axis=0)
+
+        del clf, train_x, train_y, valid_x, valid_y
+        gc.collect()
+
+    print(f'Full AUC score: {roc_auc_score(train_df["TARGET"], oof_preds):.6f}')
+
+    # Validation croisée
+    cv_scores = cross_val_score(LGBMClassifier(nthread=4), train_df[feats], train_df['TARGET'], cv=num_folds, scoring="accuracy")
+    print(f'Validation croisée (accuracy): {cv_scores.mean():.4f} ± {cv_scores.std():.4f}')
+
+    # Commenté: Suppression de la partie affichant la courbe ROC pour tous les folds
+    # plt.figure(figsize=(10, 8))
+    # for i in range(num_folds):
+    #     plt.plot(fpr_all[i], tpr_all[i], label=f'Fold {i + 1} (AUC = {roc_auc_all[i]:.2f})')
+    
+    # plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
+    # plt.xlabel('False Positive Rate')
+    # plt.ylabel('True Positive Rate')
+    # plt.title('ROC Curve for All Folds')
+    # plt.legend(loc='lower right')
+    # plt.show()
+
+    # Affichage de la matrice de confusion et courbe AUC-ROC côte à côte
+    cm = confusion_matrix(train_df['TARGET'], oof_preds > 0.5)  # Seuil de 0.5 pour classer les prédictions
+    fpr, tpr, _ = roc_curve(train_df['TARGET'], oof_preds)
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Matrice de confusion
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax[0])
+    ax[0].set_title("Matrice de confusion")
+    ax[0].set_xlabel("Prédit")
+    ax[0].set_ylabel("Réel")
+
+    # Courbe ROC
+    ax[1].plot(fpr, tpr, label=f"AUC = {roc_auc_score(train_df['TARGET'], oof_preds):.4f}")
+    ax[1].plot([0, 1], [0, 1], 'k--')
+    ax[1].set_title("Courbe ROC")
+    ax[1].set_xlabel("Taux de faux positifs")
+    ax[1].set_ylabel("Taux de vrais positifs")
+    ax[1].legend()
+
+    plt.show()
+
+    # Affichage de l'importance des caractéristiques si demandé
+    if plot_feature_importance:
+        display_importances(feature_importance_df)
+
+    # Retourner les résultats
+    return oof_preds, sub_preds, feature_importance_df
+
+
+# Nettoyer les noms de colonnes
+def clean_column_names(df):
+    # Remplacer les espaces par des underscores et supprimer les caractères spéciaux
+    df.columns = df.columns.str.replace(r'\s+', '_', regex=True)  # Remplacer les espaces par des underscores
+    df.columns = df.columns.str.replace(r'[^A-Za-z0-9_]+', '', regex=True)  # Supprimer les caractères spéciaux
+    return df
+
+def convert_object_to_category(df):
+    """
+    Convertit toutes les colonnes de type 'object' en type 'category' dans le DataFrame fourni.
+    
+    Args:
+        df (pd.DataFrame): Le DataFrame à traiter.
+    
+    Returns:
+        pd.DataFrame: Le DataFrame avec les colonnes de type 'object' converties en type 'category'.
+    """
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col] = df[col].astype('category')
+    return df
 
 # Display/plot feature importance
 def display_importances(feature_importance_df_):
